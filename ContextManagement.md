@@ -1012,7 +1012,366 @@ return `- Tool results and user messages may include <system-reminder> tags. <sy
 
 compact 后会重建一个最小可继续工作的上下文包，而不是只塞一段摘要。
 
-## 15. 一句话心智模型
+## 15. Skills 与 Subagents 的上下文管理技巧
+
+除了主查询链路，这套系统在 `SkillTool`、`AgentTool`、fork/subagent 机制里也用了很多很成熟的 context management 技巧。
+
+### 15.1 Skill 列表只给“发现信息”，不给完整内容
+
+Skill 列表不是把全部 skill 内容都塞进上下文，而是只给发现层描述，并且严格受预算控制：
+
+```ts
+// Skill listing gets 1% of the context window (in characters)
+export const SKILL_BUDGET_CONTEXT_PERCENT = 0.01
+export const CHARS_PER_TOKEN = 4
+export const DEFAULT_CHAR_BUDGET = 8_000
+
+// Per-entry hard cap. The listing is for discovery only — the Skill tool loads
+// full content on invoke, so verbose whenToUse strings waste turn-1 cache_creation
+// tokens without improving match rate.
+export const MAX_LISTING_DESC_CHARS = 250
+```
+
+来源：
+
+- `package/restored-src/src/tools/SkillTool/prompt.ts`
+
+这背后的技巧是：
+
+- 把 skill 内容分成“发现层”和“执行层”
+- 发现层只保留最小匹配信息
+- 执行时再把完整 skill prompt 动态注入
+
+这是一种典型的按需加载上下文策略。
+
+### 15.2 Skill 描述按上下文预算自动截断
+
+```ts
+export function getCharBudget(contextWindowTokens?: number): number {
+  if (contextWindowTokens) {
+    return Math.floor(
+      contextWindowTokens * CHARS_PER_TOKEN * SKILL_BUDGET_CONTEXT_PERCENT,
+    )
+  }
+  return DEFAULT_CHAR_BUDGET
+}
+```
+
+并且：
+
+```ts
+// All commands are always included (descriptions may be truncated to fit budget).
+export function getLimitedSkillToolCommands(cwd: string): Promise<Command[]> {
+  return getSkillToolCommands(cwd)
+}
+```
+
+来源：
+
+- `package/restored-src/src/tools/SkillTool/prompt.ts`
+
+技巧点：
+
+- 所有 skill 都保留“名字可见性”
+- 但描述根据预算裁剪
+- 这样既保留召回能力，又控制 token 消耗
+
+### 15.3 已加载 skill 用 tag 防重复注入
+
+Skill prompt 里有一条很实用的规则：
+
+```ts
+- If you see a <${COMMAND_NAME_TAG}> tag in the current conversation turn, the skill has ALREADY been loaded - follow the instructions directly instead of calling this tool again
+```
+
+来源：
+
+- `package/restored-src/src/tools/SkillTool/prompt.ts`
+
+这实际上是在做“上下文去重”：
+
+- 防止同一 skill 在同一轮被重复展开
+- 防止重复注入同一大段 prompt
+- 避免工具调用和 prompt 内容双重膨胀
+
+### 15.4 Agent 列表移出工具描述，避免 prompt cache bust
+
+AgentTool 里专门有一条优化：
+
+```ts
+/**
+ * Whether the agent list should be injected as an attachment message instead
+ * of embedded in the tool description.
+ *
+ * The dynamic agent list was ~10.2% of fleet cache_creation tokens: MCP async
+ * connect, /reload-plugins, or permission-mode changes mutate the list →
+ * description changes → full tool-schema cache bust.
+ */
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/prompt.ts`
+
+这背后的技巧非常关键：
+
+- 动态 agent 列表如果直接写进 tool prompt，会让工具 schema 频繁变
+- tool schema 一变，prompt cache 前缀就容易失效
+- 所以把 agent list 改成 attachment / system-reminder 注入
+
+这属于“动态上下文与静态 schema 解耦”。
+
+### 15.5 Fork 和 fresh subagent 被明确区分
+
+AgentTool prompt 里把两种 delegation 模式分得很清楚：
+
+```ts
+Fork yourself ... when the intermediate tool output isn't worth keeping in your context.
+...
+When spawning a fresh agent (with a `subagent_type`), it starts with zero context.
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/prompt.ts`
+
+这其实是非常成熟的上下文策略分流：
+
+- `fork`: 继承父上下文，适合上下文相关的研究/实现
+- `fresh subagent`: 零上下文启动，适合需要独立判断、避免父上下文污染的任务
+
+### 15.6 Fork 的核心目的是“把中间噪声隔离出去”
+
+AgentTool prompt 明说：
+
+```ts
+Fork yourself ... when the intermediate tool output isn't worth keeping in your context.
+```
+
+以及：
+
+```ts
+**Don't peek.** ... Reading the transcript mid-flight pulls the fork's tool noise into your context, which defeats the point of forking.
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/prompt.ts`
+
+这是一个非常典型的 agentic context 管理技巧：
+
+- 不是为了并行而并行
+- 而是把“探索过程的工具噪声”隔离在子线程
+- 主线程只消费最后结果，而不是消费全过程
+
+### 15.7 Fork prompt 是 directive，不是 briefing
+
+```ts
+**Writing a fork prompt.** Since the fork inherits your context, the prompt is a *directive* — what to do, not what the situation is.
+```
+
+而 fresh agent 则相反：
+
+```ts
+When spawning a fresh agent ... it starts with zero context.
+Brief the agent like a smart colleague who just walked into the room ...
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/prompt.ts`
+
+技巧点：
+
+- 继承上下文的 fork，用短 directive，避免重复背景
+- 零上下文 agent，用完整 briefing，避免理解缺口
+
+本质上是在避免两类浪费：
+
+- fork 的重复背景浪费
+- fresh agent 的信息不足返工
+
+### 15.8 Fork 共享 prompt cache，但共享的是“缓存安全前缀”
+
+`forkedAgent.ts` 的核心定义：
+
+```ts
+/**
+ * Parameters that must be identical between the fork and parent API requests
+ * to share the parent's prompt cache. The Anthropic API cache key is composed of:
+ * system prompt, tools, model, messages (prefix), and thinking config.
+ */
+export type CacheSafeParams = {
+  systemPrompt: SystemPrompt
+  userContext: { [k: string]: string }
+  systemContext: { [k: string]: string }
+  toolUseContext: ToolUseContext
+  forkContextMessages: Message[]
+}
+```
+
+来源：
+
+- `package/restored-src/src/utils/forkedAgent.ts`
+
+这是非常明确的“cache-safe prefix”设计。
+
+系统把真正决定 cache key 的因素单独抽出来，以保证 fork 查询可以复用父查询的缓存前缀。
+
+### 15.9 Fork 默认隔离可变状态，但保留 cache 命中条件
+
+`createSubagentContext()` 的注释和实现非常值得看：
+
+```ts
+/**
+ * By default, ALL mutable state is isolated to prevent interference:
+ * - readFileState: cloned from parent
+ * - abortController: new controller linked to parent
+ * - All mutation callbacks: no-op
+ */
+```
+
+同时：
+
+```ts
+// Clone by default (not fresh): cache-sharing forks process parent
+// messages containing parent tool_use_ids. A fresh state would see
+// them as unseen and make divergent replacement decisions → wire
+// prefix differs → cache miss. A clone makes identical decisions →
+// cache hit.
+```
+
+来源：
+
+- `package/restored-src/src/utils/forkedAgent.ts`
+
+这里的技巧非常高级：
+
+- 可变状态要隔离，避免主子线程互相污染
+- 但某些会影响请求字节序列的状态，又必须 clone 而不是 fresh
+- 否则上下文虽然语义相同，wire prefix 也会不同，导致 cache miss
+
+### 15.10 Fork child 用占位 tool_result 保证前缀字节一致
+
+`forkSubagent.ts` 里为了 cache sharing，专门构造了统一前缀：
+
+```ts
+/** Placeholder text used for all tool_result blocks in the fork prefix.
+ * Must be identical across all fork children for prompt cache sharing. */
+const FORK_PLACEHOLDER_RESULT = 'Fork started — processing in background'
+```
+
+以及：
+
+```ts
+ * For prompt cache sharing, all fork children must produce byte-identical
+ * API request prefixes.
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/forkSubagent.ts`
+
+这说明他们不只在做“语义相似”，而是在追求“请求前缀字节级一致”。
+
+### 15.11 Read-only subagents 主动瘦身上下文
+
+在 `runAgent.ts` 里，`Explore` / `Plan` 这类只读 agent 会主动删掉部分父上下文：
+
+```ts
+const shouldOmitClaudeMd =
+  agentDefinition.omitClaudeMd &&
+  !override?.userContext &&
+  getFeatureValue_CACHED_MAY_BE_STALE('tengu_slim_subagent_claudemd', true)
+...
+const resolvedUserContext = shouldOmitClaudeMd
+  ? userContextNoClaudeMd
+  : baseUserContext
+```
+
+还有：
+
+```ts
+const resolvedSystemContext =
+  agentDefinition.agentType === 'Explore' ||
+  agentDefinition.agentType === 'Plan'
+    ? systemContextNoGit
+    : baseSystemContext
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/runAgent.ts`
+
+技巧点：
+
+- 不是所有 subagent 都应该继承完整父上下文
+- 只读搜索型 agent 不需要完整 `CLAUDE.md` 和 stale git status
+- 主动瘦身可减少 token 开销
+
+### 15.12 Fresh subagent 默认关闭 thinking，控制输出成本
+
+```ts
+thinkingConfig: useExactTools
+  ? toolUseContext.options.thinkingConfig
+  : { type: 'disabled' as const },
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/runAgent.ts`
+
+这说明 fresh subagent 的默认策略是：
+
+- 如果是 fork child，为了 cache 对齐，继承父 thinking config
+- 如果是普通 subagent，为了控成本，直接禁掉 thinking
+
+这是把“上下文一致性”和“成本控制”分情形处理。
+
+### 15.13 Agent memory 是 agent 级的长期记忆外置
+
+`agentMemory.ts` 提供了三种记忆 scope：
+
+```ts
+export type AgentMemoryScope = 'user' | 'project' | 'local'
+```
+
+并把记忆装配成 prompt：
+
+```ts
+export function loadAgentMemoryPrompt(
+  agentType: string,
+  scope: AgentMemoryScope,
+): string {
+  ...
+  return buildMemoryPrompt({
+    displayName: 'Persistent Agent Memory',
+    memoryDir,
+    extraGuidelines: ...
+  })
+}
+```
+
+来源：
+
+- `package/restored-src/src/tools/AgentTool/agentMemory.ts`
+
+这相当于把“subagent 的长期上下文”从会话消息流中外置到磁盘。
+
+和 session memory 一样，本质上都是：
+
+- 把长期高价值信息外置
+- 需要时再重新注入 prompt
+
+但 agent memory 的粒度更细，是“按 agent type / scope”分层。
+
+## 16. 一句话总结 Skills / Subagents 的技巧
+
+如果只用一句话概括 skills / subagents 里的上下文管理思想，就是：
+
+“把可发现信息和可执行信息分层，把可继承上下文和需隔离上下文分流，把长期记忆外置，把中间噪声留在子线程，同时尽可能维持 prompt cache 的字节级稳定。”
+
+## 17. 一句话心智模型
 
 Claude Code 的 LLM Context 管理可以概括成：
 
